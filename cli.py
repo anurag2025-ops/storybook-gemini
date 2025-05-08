@@ -3,22 +3,21 @@
 cli.py — Expert-prompted kids’ story-book generator
           (google-genai 1.13.0, A4 portrait PDF)
 
-Text   : gemini-2.0-flash  (warm, playful children’s author)
-Images : imagen-3.0-generate-002 (award-winning illustrator)
-Style  : Soft-textured storybook illustration (flat 2D + watercolor vibes)
-Layout : auto-height bottom band with centred title + body
-Output : outputs/pdf/storybook_<theme>.pdf
+Changes in this version:
+• PDF saved to outputs/pdf/
+• .txt log saved to outputs/
+• Bottom overlay card is 82 % opaque for subtle image bleed-through
 """
 
 import io, json, os, sys, textwrap, time, tempfile, unicodedata
 from pathlib import Path
 from dotenv import load_dotenv
 import google.genai as genai
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from fpdf import FPDF
 
 # ─── configuration ─────────────────────────────────────────────────────────
-PAGE_SIZE  = (595, 842)          # A4 portrait (pt @72 dpi)
+PAGE_SIZE  = (595, 842)          # A4 portrait
 TEXT_MODEL = "gemini-2.0-flash"
 IMG_MODEL  = "imagen-3.0-generate-002"
 MAX_RETRY  = 2
@@ -48,38 +47,32 @@ FONT_BODY  = load_font(
      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
      "Arial.ttf"], 20)
 
-def placeholder(title):
-    img=Image.new("RGB", PAGE_SIZE, (220,220,220))
-    d  = ImageDraw.Draw(img)
-    msg=f"[Image unavailable]\n{title}"
-    box=d.multiline_textbbox((0,0),msg,font=FONT_BODY,spacing=4)
-    w,h=box[2]-box[0], box[3]-box[1]
-    d.multiline_text(((PAGE_SIZE[0]-w)//2,(PAGE_SIZE[1]-h)//2),
-                     msg,font=FONT_BODY,fill="black",spacing=4,align="center")
-    return img
+def text_bbox(draw, txt, font):
+    if hasattr(draw, "textbbox"):
+        b=draw.textbbox((0,0), txt, font=font); return b[2]-b[0], b[3]-b[1]
+    if hasattr(font, "getbbox"):
+        b=font.getbbox(txt); return b[2]-b[0], b[3]-b[1]
+    return draw.textsize(txt, font=font)
 
-# ─── initialize Google GenAI client ────────────────────────────────────────
+# ─── initialize GenAI client ───────────────────────────────────────────────
 load_dotenv()
-API_KEY=os.getenv("GOOGLE_API_KEY")
-if not API_KEY: sys.exit("❌  Set GOOGLE_API_KEY")
+API_KEY=os.getenv("GOOGLE_API_KEY") or sys.exit("❌  Set GOOGLE_API_KEY")
 client=genai.Client(api_key=API_KEY)
 
-# ─── 1 · character descriptor (after theme input) ──────────────────────────
+# ─── 1 · character descriptor ──────────────────────────────────────────────
 def character_descriptor(theme):
-    prompt=("Describe the main character for a children’s story themed "
-            f"“{theme}” in ONE vivid sentence (colours, clothing, species). "
-            "No actions.")
+    prompt=(f"Describe the main character for a children’s story themed “{theme}” "
+            "in ONE vivid sentence (colours, clothing, species). No actions.")
     desc=client.models.generate_content(model=TEXT_MODEL, contents=prompt).text.strip()
     return desc.split("\n")[0][:120]
 
-# ─── 2 · story pages (author persona, forced character) ────────────────────
+# ─── 2 · story pages ───────────────────────────────────────────────────────
 def story_pages(theme, n, char_desc):
     prompt=(
         "You are a warm, playful children’s author.\n"
-        f"Main character: {char_desc}\n"
-        f"Theme: “{theme}”\nPages: {n}\n"
-        "Return ONLY JSON {\"pages\":[{\"title\":\"…\",\"text\":\"…\"}]}\n"
-        "Each page: 3–5-word title + TWO sentences (10-15 words) featuring that character."
+        f"Main character: {char_desc}\nTheme: “{theme}”\nPages: {n}\n"
+        "Return ONLY JSON {\"pages\":[{\"title\":\"…\",\"text\":\"…\"}]}.\n"
+        "Each page: 3-5-word title + TWO sentences (10–15 words) featuring the character."
     )
     raw=client.models.generate_content(model=TEXT_MODEL, contents=prompt).text.strip()
     for cut in (raw, raw[raw.find("{"):raw.rfind("}")+1]):
@@ -87,14 +80,13 @@ def story_pages(theme, n, char_desc):
         except Exception: pass
     return [{"title":"Untitled","text":"…"}]*n
 
-# ─── 3 · illustration prompt (same character) ─────────────────────────────
+# ─── 3 · illustration prompts & cache ──────────────────────────────────────
+image_prompts=[]
 def make_image(pg, char_desc):
-    prompt=(
-        f"You are an award-winning children’s illustrator. {STYLE}. {char_desc}. "
-        "Do NOT include text, letters, captions. "
-        "Leave a blank white margin at the bottom (~10 %) for overlay. "
-        f"Scene: {pg['text']}"
-    )
+    prompt=(f"You are a children’s book illustrator. {STYLE}. {char_desc}. "
+            "No text/letters. Leave a blank margin (~10 %) at bottom. "
+            f"Scene: {pg['text']}")
+    image_prompts.append(prompt)
     for att in range(MAX_RETRY+1):
         try:
             rsp=client.models.generate_images(model=IMG_MODEL, prompt=prompt)
@@ -105,59 +97,74 @@ def make_image(pg, char_desc):
         except Exception as e:
             log(f"⚠️  Imagen error ({att+1}/{MAX_RETRY+1}): {e}")
             time.sleep(1)
-    return placeholder(pg['title'])
+    return Image.new("RGB", PAGE_SIZE, (220,220,220))
 
-# ─── 4 · overlay (auto-height, full-width wrap) ───────────────────────────
-def text_bbox(d, txt, font):
-    if hasattr(d, "textbbox"):
-        b=d.textbbox((0,0),txt,font=font); return b[2]-b[0], b[3]-b[1]
-    if hasattr(font, "getbbox"):
-        b=font.getbbox(txt); return b[2]-b[0], b[3]-b[1]
-    return d.textsize(txt,font=font)
-
+# ─── 4 · overlay with translucent rounded card ────────────────────────────
 def overlay(img, pg):
-    W,H=img.size
-    pad=28                               # larger side padding for A4
+    img = img.convert("RGBA")         # ensure alpha channel
+    W,H  = img.size
+    side_pad, vert_pad, gap = 36, 20, 6
     d = ImageDraw.Draw(img)
 
-    # Estimate wrap width in characters based on font’s average char width
-    avg_char_w = FONT_BODY.getbbox("ABCDEFGHIJKLMNOPQRSTUVWXYZ")[2] / 26
-    max_chars  = max(10, int((W - 2*pad) / avg_char_w))
-    body_text  = textwrap.fill(safe(pg["text"]), max_chars)
+    # wrap body to page width
+    avg_char = FONT_BODY.getlength("ABCDEFGHIJKLMNOPQRSTUVWXYZ") / 26
+    max_chars = int((W - 2*side_pad) / avg_char)
+    body = textwrap.fill(safe(pg["text"]), max_chars)
 
-    # Measure heights
     title_w,title_h=text_bbox(d, safe(pg["title"]), FONT_TITLE)
-    body_w, body_h = text_bbox(d, body_text, FONT_BODY)
+    body_w, body_h = text_bbox(d, body, FONT_BODY)
 
-    total_h = pad + title_h + 4 + body_h + pad
-    band_h  = total_h
+    card_h  = vert_pad + title_h + gap + body_h + vert_pad
+    card_top= H - card_h - 12
+    card_box= (side_pad//2, card_top, W-side_pad//2, card_top+card_h)
 
-    band_top = H - band_h
-    d.rectangle([0, band_top, W, H], fill="white")
+    # shadow
+    shadow = Image.new("RGBA", img.size, (0,0,0,0))
+    sdraw  = ImageDraw.Draw(shadow)
+    sdraw.rounded_rectangle(card_box, radius=18, fill=(0,0,0,120))
+    img.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(6)))
 
-    d.text(((W-title_w)//2, band_top + pad),
-           safe(pg["title"]), font=FONT_TITLE, fill="black")
+    # translucent card
+    card_layer = Image.new("RGBA", img.size, (0,0,0,0))
+    cl_draw    = ImageDraw.Draw(card_layer)
+    cl_draw.rounded_rectangle(card_box, radius=18,
+                              fill=(255,255,255,210), outline=(220,220,220,210))
+    img.alpha_composite(card_layer)
 
-    d.multiline_text(((W-body_w)//2, band_top + pad + title_h + 4),
-                     body_text, font=FONT_BODY, fill="black",
+    # text
+    d = ImageDraw.Draw(img)
+    d.text(((W-title_w)//2, card_top+vert_pad), safe(pg["title"]),
+           font=FONT_TITLE, fill="black")
+    d.multiline_text(((W-body_w)//2, card_top+vert_pad+title_h+gap),
+                     body, font=FONT_BODY, fill="black",
                      spacing=4, align="center")
-    return img
+    return img.convert("RGB")         # back to RGB for PDF
 
-# ─── 5 · build PDF ─────────────────────────────────────────────────────────
+# ─── 5 · build PDF + log file ──────────────────────────────────────────────
 def build_pdf(pages, theme, char_desc):
-    pdf=FPDF(unit="pt", format=PAGE_SIZE)
+    pdf_dir   = Path("outputs/pdf"); pdf_dir.mkdir(parents=True, exist_ok=True)
+    out_dir   = Path("outputs");     out_dir.mkdir(exist_ok=True)
+
+    safe_name="".join(c if c.isalnum() else "_" for c in theme)[:40] or "book"
+    pdf_path = pdf_dir / f"storybook_{safe_name}.pdf"
+    log_path = out_dir / f"storybook_{safe_name}_log.txt"
+
+    pdf = FPDF(unit="pt", format=PAGE_SIZE)
     for i,pg in enumerate(pages,1):
         log(f"🖼️  image {i}/{len(pages)} …")
         img=overlay(make_image(pg,char_desc), pg)
-        tmp=tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        img.save(tmp.name,"PNG")
-        pdf.add_page()
-        pdf.image(tmp.name, x=0, y=0, w=PAGE_SIZE[0], h=PAGE_SIZE[1])
-    out_dir=Path("outputs/pdf"); out_dir.mkdir(parents=True, exist_ok=True)
-    safe_name="".join(c if c.isalnum() else "_" for c in theme)[:40] or "book"
-    out=out_dir/f"storybook_{safe_name}.pdf"
-    pdf.output(out.as_posix())
-    print(f"\n✅  Saved → {out.resolve()}")
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".png") as tmp:
+            img.save(tmp.name,"PNG")
+            pdf.add_page(); pdf.image(tmp.name,x=0,y=0,w=PAGE_SIZE[0],h=PAGE_SIZE[1])
+    pdf.output(pdf_path.as_posix())
+    print(f"✅  PDF  → {pdf_path.resolve()}")
+
+    with open(log_path,"w",encoding="utf-8") as f:
+        f.write(f"Theme: {theme}\nCharacter: {char_desc}\n\nPages:\n")
+        for p in pages: f.write(f"- {p['title']}: {p['text']}\n")
+        f.write("\nImage prompts:\n")
+        for i,prompt in enumerate(image_prompts,1): f.write(f"[{i}] {prompt}\n")
+    print(f"📝  Log → {log_path.resolve()}")
 
 # ─── CLI ───────────────────────────────────────────────────────────────────
 if __name__=="__main__":
@@ -165,8 +172,6 @@ if __name__=="__main__":
     try: pages=int(input("Pages? (default 6): ").strip() or 6)
     except ValueError: pages=6
 
-    char_desc = character_descriptor(theme)
-    log(f"🧸 Main character → {char_desc}")
-
-    pages_data = story_pages(theme, pages, char_desc)
+    char_desc=character_descriptor(theme); log(f"🧸 Character → {char_desc}")
+    pages_data=story_pages(theme, pages, char_desc)
     build_pdf(pages_data, theme, char_desc)
